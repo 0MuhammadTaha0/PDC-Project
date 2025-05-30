@@ -3,56 +3,61 @@ import axios from 'axios';
 import './App.css';
 
 function App() {
-  const [imageFile, setImageFile] = useState(null);
-  const [filter, setFilter] = useState('average');
+  const [imageFiles, setImageFiles] = useState([]);
+  const [selectedFilters, setSelectedFilters] = useState([]);
+  const [mode, setMode] = useState('pipeline'); // pipeline or independent
   const [processing, setProcessing] = useState(false);
   const [progress, setProgress] = useState(0);
-  const [resultImageUrl, setResultImageUrl] = useState(null);
+  const [resultZipUrl, setResultZipUrl] = useState(null);
 
-  // Handle image input change
   const handleImageChange = (e) => {
-    setImageFile(e.target.files[0]);
-    setResultImageUrl(null); // Reset result when new image is uploaded
+    setImageFiles([...e.target.files]);
+    setResultZipUrl(null);
   };
 
-  // Handle filter change
-  const handleFilterChange = (e) => {
-    setFilter(e.target.value);
+  const handleFilterToggle = (e) => {
+    const value = e.target.value;
+    setSelectedFilters((prev) =>
+      prev.includes(value) ? prev.filter((f) => f !== value) : [...prev, value]
+    );
   };
 
-  // Upload and process image
-  const handleProcessImage = async () => {
-    if (!imageFile) {
-      alert("Please upload an image first.");
+  const handleModeChange = (e) => {
+    setMode(e.target.value);
+  };
+
+  const handleProcessImages = async () => {
+    if (!imageFiles.length) {
+      alert("Please upload at least one image.");
+      return;
+    }
+    if (!selectedFilters.length) {
+      alert("Please select at least one filter.");
       return;
     }
 
     const formData = new FormData();
-    formData.append('image', imageFile);
-    formData.append('filter', filter);
+    imageFiles.forEach((file) => formData.append('images', file));
+    formData.append('filters', selectedFilters.join(','));
+    formData.append('mode', mode);
 
     try {
       setProcessing(true);
-      setProgress(30); // Fake progress step 1
+      setProgress(30);
 
-      const response = await axios.post(
-        'http://localhost:8080/process',
-        formData,
-        {
-          responseType: 'blob', // We'll get back an image
-          onUploadProgress: (e) => {
-            const percent = Math.round((e.loaded * 100) / e.total);
-            setProgress(percent < 90 ? percent : 90); // Cap at 90% until response
-          }
+      const response = await axios.post('http://localhost:8080/process', formData, {
+        responseType: 'blob',
+        onUploadProgress: (e) => {
+          const percent = Math.round((e.loaded * 100) / e.total);
+          setProgress(percent < 90 ? percent : 90);
         }
-      );
+      });
 
-      // Step 3: Convert image blob to URL
-      const imageUrl = URL.createObjectURL(response.data);
-      setResultImageUrl(imageUrl);
+      const zipUrl = URL.createObjectURL(response.data);
+      setResultZipUrl(zipUrl);
       setProgress(100);
-    } catch (error) {
-      console.error("Image processing failed:", error);
+    } catch (err) {
+      console.error("Processing failed:", err);
       alert("Image processing failed.");
     } finally {
       setProcessing(false);
@@ -63,41 +68,38 @@ function App() {
     <div className="App">
       <h1>Distributed Image Processing</h1>
 
-      {/* Image Upload */}
-      <input type="file" accept="image/*" onChange={handleImageChange} />
+      <input type="file" accept="image/*" multiple onChange={handleImageChange} />
 
-      {/* Filter Selection */}
-      <select value={filter} onChange={handleFilterChange}>
-        <option value="average">Averaging Filter</option>
-        {/* Future filters can be added here */}
-      </select>
+      <fieldset>
+        <legend>Select Filters:</legend>
+        <label><input type="checkbox" value="average" onChange={handleFilterToggle} /> Averaging</label><br />
+        <label><input type="checkbox" value="grayscale" onChange={handleFilterToggle} /> Grayscale</label><br />
+        <label><input type="checkbox" value="sharpen" onChange={handleFilterToggle} /> Sharpen</label><br />
+        <label><input type="checkbox" value="denoise" onChange={handleFilterToggle} /> Denoise</label>
+      </fieldset>
 
-      {/* Process Button */}
-      <button onClick={handleProcessImage} disabled={processing}>
+      <fieldset>
+        <legend>Processing Mode:</legend>
+        <label><input type="radio" name="mode" value="pipeline" checked={mode === 'pipeline'} onChange={handleModeChange} /> Pipeline (all filters sequentially)</label><br />
+        <label><input type="radio" name="mode" value="independent" checked={mode === 'independent'} onChange={handleModeChange} /> Independent (each filter separately)</label>
+      </fieldset>
+
+      <button onClick={handleProcessImages} disabled={processing}>
         {processing ? 'Processing...' : 'Process'}
       </button>
 
-      {/* Progress Bar */}
       {processing && (
         <div style={{ width: '300px', marginTop: '1rem' }}>
-          <div style={{
-            height: '20px',
-            width: `${progress}%`,
-            backgroundColor: '#4caf50',
-            transition: 'width 0.3s ease'
-          }} />
+          <div style={{ height: '20px', width: `${progress}%`, backgroundColor: '#4caf50', transition: 'width 0.3s ease' }} />
           <p>{progress}%</p>
         </div>
       )}
 
-      {/* Result Display */}
-      {resultImageUrl && (
+      {resultZipUrl && (
         <div style={{ marginTop: '2rem' }}>
-          <h3>Processed Image:</h3>
-          <img src={resultImageUrl} alt="Processed" style={{ maxWidth: '500px' }} />
-          <br />
-          <a href={resultImageUrl} download="processed.jpg">
-            <button>Download Image</button>
+          <h3>Download Results:</h3>
+          <a href={resultZipUrl} download="processed_images.zip">
+            <button>Download ZIP</button>
           </a>
         </div>
       )}

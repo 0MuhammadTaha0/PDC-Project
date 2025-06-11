@@ -12,6 +12,7 @@ function App() {
   const [progress, setProgress] = useState(0);
   const [resultZipUrl, setResultZipUrl] = useState(null);
   const [error, setError] = useState(null);
+  const [brightnessLevel, setBrightnessLevel] = useState(30);
 
   // Handle image file input changes
   const handleImageChange = (e) => {
@@ -50,6 +51,10 @@ function App() {
 
     if (enableCompression) {
       formData.append('compression_percent', compressionPercent.toString());
+    }
+
+    if (enhancements.includes("brightness")) {
+      formData.append("brightness_level", brightnessLevel);
     }
 
     try {
@@ -104,10 +109,29 @@ function App() {
           <div className="checkbox-group">
             <label><input type="checkbox" value="smoothing" onChange={toggleEnhancement} /> Smoothing</label>
             <label><input type="checkbox" value="blackwhite" onChange={toggleEnhancement} /> Black & White</label>
+            <label><input type="checkbox" value="edge-detection" onChange={toggleEnhancement} /> Edge Detection</label>
             <label><input type="checkbox" value="clarity" onChange={toggleEnhancement} /> Clarity</label>
             <label><input type="checkbox" value="noise-reduction" onChange={toggleEnhancement} /> Noise Reduction</label>
+            <label><input type="checkbox" value="brightness" onChange={toggleEnhancement} /> Brightness</label>
           </div>
         </fieldset>
+
+        {/* Add a brightness level slider */}
+
+        {enhancements.includes("brightness") && (
+          <div className="range-slider">
+            <input
+              type="range"
+              min="-100"
+              max="100"
+              value={brightnessLevel}
+              onChange={(e) => setBrightnessLevel(parseInt(e.target.value))}
+            />
+            <p><strong>{brightnessLevel > 0 ? "+" : ""}{brightnessLevel}</strong> Brightness</p>
+          </div>
+        )}
+
+
 
         {/* Processing mode selection */}
         <fieldset>

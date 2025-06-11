@@ -35,11 +35,28 @@ def ensure_bgr(img):
         return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     return img
 
+def apply_edge(img):
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 100, 200)
+    return cv2.cvtColor(edges, cv2.COLOR_GRAY2BGR)
+
+def apply_brightness(img, value=30):
+    value = int(value)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    v = v.astype(np.int16)
+    v = np.clip(v + value, 0, 255)
+    v = v.astype(np.uint8)
+    final_hsv = cv2.merge((h, s, v))
+    return cv2.cvtColor(final_hsv, cv2.COLOR_HSV2BGR)
+
 ENHANCEMENT_FUNCTIONS = {
     'average': apply_averaging_filter,
     'grayscale': apply_grayscale,
     'sharpen': apply_sharpen,
-    'denoise': apply_denoise
+    'denoise': apply_denoise,
+    'edge': apply_edge,
+    'brightness': apply_brightness
 }
 
 # Map frontend enhancement names to backend functions
@@ -47,18 +64,22 @@ ENHANCEMENT_MAP = {
     'smoothing': 'average',
     'blackwhite': 'grayscale',
     'clarity': 'sharpen',
-    'noise-reduction': 'denoise'
+    'noise-reduction': 'denoise',
+    'edge-detection': 'edge',
+    'brightness': 'brightness'
 }
 
-def process_image_pipeline(image_bytes, selected_enhancements, filename, compression):
+def process_image_pipeline(image_bytes, selected_enhancements, filename, compression, brightness_level=30):
     img_array = np.frombuffer(image_bytes, dtype=np.uint8)
     img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
 
     for i, enh in enumerate(selected_enhancements):
-        if enh in ENHANCEMENT_FUNCTIONS:
+        if enh == 'brightness':
+            img = apply_brightness(img, value=brightness_level)
+        elif enh in ENHANCEMENT_FUNCTIONS:
             img = ENHANCEMENT_FUNCTIONS[enh](img)
-            if i < len(selected_enhancements) - 1:
-                img = ensure_bgr(img)
+        if i < len(selected_enhancements) - 1:
+            img = ensure_bgr(img)
 
     img = ensure_bgr(img)
     compression_quality = 100 - compression if compression is not None else 95
@@ -66,19 +87,23 @@ def process_image_pipeline(image_bytes, selected_enhancements, filename, compres
     unique_name = f"{uuid.uuid4().hex}_{filename}"
     return (unique_name, processed_bytes.tobytes())
 
-def process_individual_enhancements(image_bytes, selected_enhancements, filename, compression):
+def process_individual_enhancements(image_bytes, selected_enhancements, filename, compression, brightness_level=30):
     img_array = np.frombuffer(image_bytes, dtype=np.uint8)
     img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
 
     results = []
     for enh in selected_enhancements:
-        if enh in ENHANCEMENT_FUNCTIONS:
+        if enh == 'brightness':
+            processed = apply_brightness(img, value=brightness_level)
+        elif enh in ENHANCEMENT_FUNCTIONS:
             processed = ENHANCEMENT_FUNCTIONS[enh](img)
-            processed = ensure_bgr(processed)
-            compression_quality = 100 - compression if compression is not None else 95
-            _, processed_bytes = cv2.imencode('.jpg', processed, [int(cv2.IMWRITE_JPEG_QUALITY), compression_quality])
-            unique_name = f"{uuid.uuid4().hex}_{enh}_{filename}"
-            results.append((unique_name, processed_bytes.tobytes()))
+        else:
+            continue
+        processed = ensure_bgr(processed)
+        compression_quality = 100 - compression if compression is not None else 95
+        _, processed_bytes = cv2.imencode('.jpg', processed, [int(cv2.IMWRITE_JPEG_QUALITY), compression_quality])
+        unique_name = f"{uuid.uuid4().hex}_{enh}_{filename}"
+        results.append((unique_name, processed_bytes.tobytes()))
     return results
 
 @app.route('/process', methods=['POST'])
@@ -106,6 +131,15 @@ def process_images():
     except ValueError:
         compression_percent = 0
 
+    # getting brightness level from form data
+
+    brightness_level = 30  # Default value
+    if 'brightness_level' in request.form:
+        try:
+            brightness_level = int(request.form['brightness_level'])
+        except ValueError:
+            brightness_level = 30
+
     # If no enhancements and no compression, return error
     if not selected_enhancements and not compression_enabled:
         return jsonify({"error": "No enhancements or compression selected"}), 400
@@ -124,11 +158,11 @@ def process_images():
     
     if mode == 'independent' and selected_enhancements:
         result_lists = image_rdd.flatMap(
-            lambda tup: process_individual_enhancements(tup[0], selected_enhancements, tup[1], compression_value)
+            lambda tup: process_individual_enhancements(tup[0], selected_enhancements, tup[1], compression_value, brightness_level)
         ).collect()
     else:
         result_lists = image_rdd.map(
-            lambda tup: process_image_pipeline(tup[0], selected_enhancements, tup[1], compression_value)
+            lambda tup: process_image_pipeline(tup[0], selected_enhancements, tup[1], compression_value, brightness_level)
         ).collect()
 
     # Handle case where no results were produced

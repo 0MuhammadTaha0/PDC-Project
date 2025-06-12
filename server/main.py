@@ -50,6 +50,67 @@ def apply_brightness(img, value=30):
     final_hsv = cv2.merge((h, s, v))
     return cv2.cvtColor(final_hsv, cv2.COLOR_HSV2BGR)
 
+def process_images_per_image(image_rdd, selected_enhancements, compression_value, brightness_level):
+    return image_rdd.map(
+        lambda tup: process_image_pipeline(tup[0], selected_enhancements, tup[1], compression_value, brightness_level)
+    ).collect()
+
+def split_image_into_chunks(img, chunk_size=256):
+    h, w = img.shape[:2]
+    chunks = []
+    for y in range(0, h, chunk_size):
+        for x in range(0, w, chunk_size):
+            chunk = img[y:y+chunk_size, x:x+chunk_size]
+            chunks.append(((y, x), chunk))
+    return chunks, h, w
+
+def merge_chunks(chunks, h, w, chunk_size=256):
+    result = np.zeros((h, w, 3), dtype=np.uint8)
+    for (y, x), chunk in chunks:
+        result[y:y+chunk.shape[0], x:x+chunk.shape[1]] = chunk
+    return result
+
+def process_images_per_chunk(image_rdd, selected_enhancements, compression_value, brightness_level):
+    def process_chunks(image_bytes, filename):
+        img_array = np.frombuffer(image_bytes, dtype=np.uint8)
+        img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        chunks, h, w = split_image_into_chunks(img)
+        processed_chunks = []
+        for (y, x), chunk in chunks:
+            for enh in selected_enhancements:
+                if enh == 'brightness':
+                    chunk = apply_brightness(chunk, value=brightness_level)
+                elif enh in ENHANCEMENT_FUNCTIONS:
+                    chunk = ENHANCEMENT_FUNCTIONS[enh](chunk)
+                chunk = ensure_bgr(chunk)
+            processed_chunks.append(((y, x), chunk))
+        merged = merge_chunks(processed_chunks, h, w)
+        compression_quality = 100 - compression_value if compression_value is not None else 95
+        _, processed_bytes = cv2.imencode('.jpg', merged, [int(cv2.IMWRITE_JPEG_QUALITY), compression_quality])
+        unique_name = f"{uuid.uuid4().hex}_{filename}"
+        return (unique_name, processed_bytes.tobytes())
+    return image_rdd.map(lambda tup: process_chunks(tup[0], tup[1])).collect()
+
+def process_images_pipeline(image_rdd, selected_enhancements, compression_value, brightness_level):
+    def pipeline(img):
+        for enh in selected_enhancements:
+            if enh == 'brightness':
+                img = apply_brightness(img, value=brightness_level)
+            elif enh in ENHANCEMENT_FUNCTIONS:
+                img = ENHANCEMENT_FUNCTIONS[enh](img)
+            img = ensure_bgr(img)
+        return img
+
+    def process(image_bytes, filename):
+        img_array = np.frombuffer(image_bytes, dtype=np.uint8)
+        img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        img = pipeline(img)
+        compression_quality = 100 - compression_value if compression_value is not None else 95
+        _, processed_bytes = cv2.imencode('.jpg', img, [int(cv2.IMWRITE_JPEG_QUALITY), compression_quality])
+        unique_name = f"{uuid.uuid4().hex}_{filename}"
+        return (unique_name, processed_bytes.tobytes())
+    return image_rdd.map(lambda tup: process(tup[0], tup[1])).collect()
+
 ENHANCEMENT_FUNCTIONS = {
     'average': apply_averaging_filter,
     'grayscale': apply_grayscale,
@@ -87,24 +148,24 @@ def process_image_pipeline(image_bytes, selected_enhancements, filename, compres
     unique_name = f"{uuid.uuid4().hex}_{filename}"
     return (unique_name, processed_bytes.tobytes())
 
-def process_individual_enhancements(image_bytes, selected_enhancements, filename, compression, brightness_level=30):
-    img_array = np.frombuffer(image_bytes, dtype=np.uint8)
-    img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+# def process_individual_enhancements(image_bytes, selected_enhancements, filename, compression, brightness_level=30):
+#     img_array = np.frombuffer(image_bytes, dtype=np.uint8)
+#     img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
 
-    results = []
-    for enh in selected_enhancements:
-        if enh == 'brightness':
-            processed = apply_brightness(img, value=brightness_level)
-        elif enh in ENHANCEMENT_FUNCTIONS:
-            processed = ENHANCEMENT_FUNCTIONS[enh](img)
-        else:
-            continue
-        processed = ensure_bgr(processed)
-        compression_quality = 100 - compression if compression is not None else 95
-        _, processed_bytes = cv2.imencode('.jpg', processed, [int(cv2.IMWRITE_JPEG_QUALITY), compression_quality])
-        unique_name = f"{uuid.uuid4().hex}_{enh}_{filename}"
-        results.append((unique_name, processed_bytes.tobytes()))
-    return results
+#     results = []
+#     for enh in selected_enhancements:
+#         if enh == 'brightness':
+#             processed = apply_brightness(img, value=brightness_level)
+#         elif enh in ENHANCEMENT_FUNCTIONS:
+#             processed = ENHANCEMENT_FUNCTIONS[enh](img)
+#         else:
+#             continue
+#         processed = ensure_bgr(processed)
+#         compression_quality = 100 - compression if compression is not None else 95
+#         _, processed_bytes = cv2.imencode('.jpg', processed, [int(cv2.IMWRITE_JPEG_QUALITY), compression_quality])
+#         unique_name = f"{uuid.uuid4().hex}_{enh}_{filename}"
+#         results.append((unique_name, processed_bytes.tobytes()))
+#     return results
 
 @app.route('/process', methods=['POST'])
 def process_images():
@@ -145,25 +206,28 @@ def process_images():
         return jsonify({"error": "No enhancements or compression selected"}), 400
 
     compression_value = compression_percent if compression_enabled else None
-    mode = request.form.get('mode', 'pipeline')
+
+    # Strategy Selection:
+    strategy = request.form.get('strategy', 'per-image')
     
-    # Only allow 'pipeline' or 'independent' modes
-    if mode not in ['pipeline', 'independent']:
-        mode = 'pipeline'
+    # mode = request.form.get('mode', 'pipeline')
+
+
+    # # Only allow 'pipeline' or 'independent' modes
+    # if mode not in ['pipeline', 'independent']:
+    #     mode = 'pipeline'
         
     images_data = [(f.read(), f.filename) for f in image_files]
     image_rdd = sc.parallelize(images_data)
     
-    result_lists = []
-    
-    if mode == 'independent' and selected_enhancements:
-        result_lists = image_rdd.flatMap(
-            lambda tup: process_individual_enhancements(tup[0], selected_enhancements, tup[1], compression_value, brightness_level)
-        ).collect()
+    if strategy == 'per-image':
+        result_lists = process_images_per_image(image_rdd, selected_enhancements, compression_value, brightness_level)
+    elif strategy == 'per-chunk':
+        result_lists = process_images_per_chunk(image_rdd, selected_enhancements, compression_value, brightness_level)
+    elif strategy == 'pipeline':
+        result_lists = process_images_pipeline(image_rdd, selected_enhancements, compression_value, brightness_level)
     else:
-        result_lists = image_rdd.map(
-            lambda tup: process_image_pipeline(tup[0], selected_enhancements, tup[1], compression_value, brightness_level)
-        ).collect()
+        return jsonify({"error": "Unknown processing strategy"}), 400
 
     # Handle case where no results were produced
     if not result_lists:

@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, make_response
 from flask_cors import CORS
 from pyspark import SparkContext, SparkConf
 import cv2
@@ -9,9 +9,10 @@ import uuid
 import time
 import math
 import json
+import concurrent.futures
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, expose_headers=["X-Processing-Time"])
 
 conf = SparkConf().setAppName("DistributedImageProcessor").setMaster("local[*]")
 sc = SparkContext(conf=conf)
@@ -71,19 +72,26 @@ def merge_chunks(chunks, h, w, chunk_size=256):
     return result
 
 def process_images_per_chunk(image_rdd, selected_enhancements, compression_value, brightness_level):
+    def process_chunk(args):
+        (y, x), chunk = args
+        for enh in selected_enhancements:
+            if enh == 'brightness':
+                chunk = apply_brightness(chunk, value=brightness_level)
+            elif enh in ENHANCEMENT_FUNCTIONS:
+                chunk = ENHANCEMENT_FUNCTIONS[enh](chunk)
+            chunk = ensure_bgr(chunk)
+        return ((y, x), chunk)
+
     def process_chunks(image_bytes, filename):
         img_array = np.frombuffer(image_bytes, dtype=np.uint8)
         img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
         chunks, h, w = split_image_into_chunks(img)
-        processed_chunks = []
-        for (y, x), chunk in chunks:
-            for enh in selected_enhancements:
-                if enh == 'brightness':
-                    chunk = apply_brightness(chunk, value=brightness_level)
-                elif enh in ENHANCEMENT_FUNCTIONS:
-                    chunk = ENHANCEMENT_FUNCTIONS[enh](chunk)
-                chunk = ensure_bgr(chunk)
-            processed_chunks.append(((y, x), chunk))
+        args_list = [((y, x), chunk) for (y, x), chunk in chunks]
+
+        # Parallel processing of chunks
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            processed_chunks = list(executor.map(process_chunk, args_list))
+
         merged = merge_chunks(processed_chunks, h, w)
         compression_quality = 100 - compression_value if compression_value is not None else 95
         _, processed_bytes = cv2.imencode('.jpg', merged, [int(cv2.IMWRITE_JPEG_QUALITY), compression_quality])
@@ -148,27 +156,78 @@ def process_image_pipeline(image_bytes, selected_enhancements, filename, compres
     unique_name = f"{uuid.uuid4().hex}_{filename}"
     return (unique_name, processed_bytes.tobytes())
 
-# def process_individual_enhancements(image_bytes, selected_enhancements, filename, compression, brightness_level=30):
-#     img_array = np.frombuffer(image_bytes, dtype=np.uint8)
-#     img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+def process_images_per_image_independent(image_rdd, selected_enhancements, compression_value, brightness_level):
+    def process(image_bytes, filename):
+        img_array = np.frombuffer(image_bytes, dtype=np.uint8)
+        img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        results = []
+        for enh in selected_enhancements:
+            if enh == 'brightness':
+                processed = apply_brightness(img, value=brightness_level)
+            elif enh in ENHANCEMENT_FUNCTIONS:
+                processed = ENHANCEMENT_FUNCTIONS[enh](img)
+            else:
+                continue
+            processed = ensure_bgr(processed)
+            compression_quality = 100 - compression_value if compression_value is not None else 95
+            _, processed_bytes = cv2.imencode('.jpg', processed, [int(cv2.IMWRITE_JPEG_QUALITY), compression_quality])
+            unique_name = f"{uuid.uuid4().hex}_{enh}_{filename}"
+            results.append((unique_name, processed_bytes.tobytes()))
+        return results
+    # Flatten the list of lists
+    return [item for sublist in image_rdd.map(lambda tup: process(tup[0], tup[1])).collect() for item in sublist]
 
-#     results = []
-#     for enh in selected_enhancements:
-#         if enh == 'brightness':
-#             processed = apply_brightness(img, value=brightness_level)
-#         elif enh in ENHANCEMENT_FUNCTIONS:
-#             processed = ENHANCEMENT_FUNCTIONS[enh](img)
-#         else:
-#             continue
-#         processed = ensure_bgr(processed)
-#         compression_quality = 100 - compression if compression is not None else 95
-#         _, processed_bytes = cv2.imencode('.jpg', processed, [int(cv2.IMWRITE_JPEG_QUALITY), compression_quality])
-#         unique_name = f"{uuid.uuid4().hex}_{enh}_{filename}"
-#         results.append((unique_name, processed_bytes.tobytes()))
-#     return results
+def process_images_per_chunk_independent(image_rdd, selected_enhancements, compression_value, brightness_level):
+    def process_chunk(args):
+        (y, x), chunk, img = args
+        results = []
+        for enh in selected_enhancements:
+            if enh == 'brightness':
+                processed = apply_brightness(chunk, value=brightness_level)
+            elif enh in ENHANCEMENT_FUNCTIONS:
+                processed = ENHANCEMENT_FUNCTIONS[enh](chunk)
+            else:
+                continue
+            processed = ensure_bgr(processed)
+            results.append((enh, (y, x), processed))
+        return results
+
+    def process_chunks(image_bytes, filename):
+        img_array = np.frombuffer(image_bytes, dtype=np.uint8)
+        img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        chunks, h, w = split_image_into_chunks(img)
+        args_list = [((y, x), chunk, img) for (y, x), chunk in chunks]
+
+        all_results = []
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            chunk_results = list(executor.map(process_chunk, args_list))
+        # chunk_results is a list of lists
+        for results in chunk_results:
+            for enh, (y, x), processed in results:
+                all_results.append((enh, (y, x), processed))
+
+        # Group by enhancement
+        from collections import defaultdict
+        enh_to_chunks = defaultdict(list)
+        for enh, (y, x), processed in all_results:
+            enh_to_chunks[enh].append(((y, x), processed))
+
+        output = []
+        for enh, chunks in enh_to_chunks.items():
+            merged = merge_chunks(chunks, h, w)
+            compression_quality = 100 - compression_value if compression_value is not None else 95
+            _, processed_bytes = cv2.imencode('.jpg', merged, [int(cv2.IMWRITE_JPEG_QUALITY), compression_quality])
+            unique_name = f"{uuid.uuid4().hex}_{enh}_{filename}"
+            output.append((unique_name, processed_bytes.tobytes()))
+        return output
+
+    # Flatten the list of lists
+    return [item for sublist in image_rdd.map(lambda tup: process_chunks(tup[0], tup[1])).collect() for item in sublist]
+
 
 @app.route('/process', methods=['POST'])
 def process_images():
+    start_time = time.time()
     if 'images' not in request.files:
         return jsonify({"error": "No images uploaded"}), 400
 
@@ -210,22 +269,30 @@ def process_images():
     # Strategy Selection:
     strategy = request.form.get('strategy', 'per-image')
     
-    # mode = request.form.get('mode', 'pipeline')
+    mode = request.form.get('mode', 'pipeline')
 
 
     # # Only allow 'pipeline' or 'independent' modes
-    # if mode not in ['pipeline', 'independent']:
-    #     mode = 'pipeline'
+    if mode not in ['pipeline', 'independent']:
+        mode = 'pipeline'
         
     images_data = [(f.read(), f.filename) for f in image_files]
     image_rdd = sc.parallelize(images_data)
     
     if strategy == 'per-image':
-        result_lists = process_images_per_image(image_rdd, selected_enhancements, compression_value, brightness_level)
+        if mode == 'pipeline':
+            result_lists = process_images_per_image(image_rdd, selected_enhancements, compression_value, brightness_level)
+        elif mode == 'independent':
+            result_lists = process_images_per_image_independent(image_rdd, selected_enhancements, compression_value, brightness_level)
+        else:
+            return jsonify({"error": "Unknown processing mode"}), 400
     elif strategy == 'per-chunk':
-        result_lists = process_images_per_chunk(image_rdd, selected_enhancements, compression_value, brightness_level)
-    elif strategy == 'pipeline':
-        result_lists = process_images_pipeline(image_rdd, selected_enhancements, compression_value, brightness_level)
+        if mode == 'pipeline':
+            result_lists = process_images_per_chunk(image_rdd, selected_enhancements, compression_value, brightness_level)
+        elif mode == 'independent':
+            result_lists = process_images_per_chunk_independent(image_rdd, selected_enhancements, compression_value, brightness_level)
+        else:
+            return jsonify({"error": "Unknown processing mode"}), 400
     else:
         return jsonify({"error": "Unknown processing strategy"}), 400
 
@@ -239,12 +306,17 @@ def process_images():
             zipf.writestr(fname, img_bytes)
     memory_zip.seek(0)
 
-    return send_file(
+    end_time = time.time()
+    processing_time = end_time - start_time
+
+    response = send_file(
         memory_zip,
         mimetype='application/zip',
         as_attachment=True,
         download_name='processed_images.zip'
     )
+    response.headers['X-Processing-Time'] = str(processing_time)
+    return response
 
 if __name__ == '__main__':
     app.run(debug=True, port=8080)

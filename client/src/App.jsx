@@ -14,6 +14,7 @@ function App() {
   const [error, setError] = useState(null);
   const [brightnessLevel, setBrightnessLevel] = useState(30);
   const [strategy, setStrategy] = useState("per-image");
+  const [processingTime, setProcessingTime] = useState(null);
 
   // Handle image file input changes
   const handleImageChange = (e) => {
@@ -76,6 +77,10 @@ function App() {
           },
         }
       );
+
+      // Get processing time from response headers
+      const processingTime = response.headers["x-processing-time"];
+      setProcessingTime(processingTime);
 
       // Create download URL for the response ZIP file
       const zipUrl = URL.createObjectURL(response.data);
@@ -205,16 +210,6 @@ function App() {
                 />
                 Per Chunk (for large images)
               </label>
-              <label>
-                <input
-                  type="radio"
-                  name="strategy"
-                  value="pipeline"
-                  checked={strategy === "pipeline"}
-                  onChange={(e) => setStrategy(e.target.value)}
-                />
-                Pipeline (chain enhancements)
-              </label>
             </div>
           </fieldset>
 
@@ -294,6 +289,14 @@ function App() {
           <div className="progress-container">
             <div className="progress-bar" style={{ width: `${progress}%` }} />
             <p>{progress}%</p>
+          </div>
+        )}
+
+        {processingTime && (
+          <div className="processing-time">
+            <p>
+              Processing Time: {parseFloat(processingTime).toFixed(2)} seconds
+            </p>
           </div>
         )}
 

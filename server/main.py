@@ -10,6 +10,7 @@ import time
 import math
 import json
 import concurrent.futures
+import gc
 
 app = Flask(__name__)
 CORS(app, expose_headers=["X-Processing-Time"])
@@ -251,8 +252,6 @@ def process_images():
     except ValueError:
         compression_percent = 0
 
-    # getting brightness level from form data
-
     brightness_level = 30  # Default value
     if 'brightness_level' in request.form:
         try:
@@ -271,52 +270,74 @@ def process_images():
     
     mode = request.form.get('mode', 'pipeline')
 
-
-    # # Only allow 'pipeline' or 'independent' modes
+    # Only allow 'pipeline' or 'independent' modes
     if mode not in ['pipeline', 'independent']:
         mode = 'pipeline'
-        
-    images_data = [(f.read(), f.filename) for f in image_files]
-    image_rdd = sc.parallelize(images_data)
     
-    if strategy == 'per-image':
-        if mode == 'pipeline':
-            result_lists = process_images_per_image(image_rdd, selected_enhancements, compression_value, brightness_level)
-        elif mode == 'independent':
-            result_lists = process_images_per_image_independent(image_rdd, selected_enhancements, compression_value, brightness_level)
+    try:
+        # Read image data
+        images_data = [(f.read(), f.filename) for f in image_files]
+        
+        # Clear previous cached RDDs to free memory
+        sc.setLocalProperty("spark.job.description", f"ImageProcessing-{uuid.uuid4()}")
+        
+        # Create a new RDD with the current images
+        image_rdd = sc.parallelize(images_data)
+        
+        # Process based on strategy and mode
+        if strategy == 'per-image':
+            if mode == 'pipeline':
+                result_lists = process_images_per_image(image_rdd, selected_enhancements, compression_value, brightness_level)
+            elif mode == 'independent':
+                result_lists = process_images_per_image_independent(image_rdd, selected_enhancements, compression_value, brightness_level)
+            else:
+                return jsonify({"error": "Unknown processing mode"}), 400
+        elif strategy == 'per-chunk':
+            if mode == 'pipeline':
+                result_lists = process_images_per_chunk(image_rdd, selected_enhancements, compression_value, brightness_level)
+            elif mode == 'independent':
+                result_lists = process_images_per_chunk_independent(image_rdd, selected_enhancements, compression_value, brightness_level)
+            else:
+                return jsonify({"error": "Unknown processing mode"}), 400
         else:
-            return jsonify({"error": "Unknown processing mode"}), 400
-    elif strategy == 'per-chunk':
-        if mode == 'pipeline':
-            result_lists = process_images_per_chunk(image_rdd, selected_enhancements, compression_value, brightness_level)
-        elif mode == 'independent':
-            result_lists = process_images_per_chunk_independent(image_rdd, selected_enhancements, compression_value, brightness_level)
-        else:
-            return jsonify({"error": "Unknown processing mode"}), 400
-    else:
-        return jsonify({"error": "Unknown processing strategy"}), 400
+            return jsonify({"error": "Unknown processing strategy"}), 400
 
-    # Handle case where no results were produced
-    if not result_lists:
-        return jsonify({"error": "No images were successfully processed"}), 500
-
-    memory_zip = io.BytesIO()
-    with zipfile.ZipFile(memory_zip, 'w') as zipf:
-        for fname, img_bytes in result_lists:
-            zipf.writestr(fname, img_bytes)
-    memory_zip.seek(0)
-
-    end_time = time.time()
-    processing_time = end_time - start_time
-
-    response = send_file(
-        memory_zip,
-        mimetype='application/zip',
-        as_attachment=True,
-        download_name='processed_images.zip'
-    )
-    response.headers['X-Processing-Time'] = str(processing_time)
-    return response
+        # Handle case where no results were produced
+        if not result_lists:
+            return jsonify({"error": "No images were successfully processed"}), 500
+        
+        # Create zip file from results
+        memory_zip = io.BytesIO()
+        with zipfile.ZipFile(memory_zip, 'w') as zipf:
+            for fname, img_bytes in result_lists:
+                zipf.writestr(fname, img_bytes)
+        memory_zip.seek(0)
+        
+        end_time = time.time()
+        processing_time = end_time - start_time
+        
+        # Unpersist RDDs to free memory
+        image_rdd.unpersist()
+        
+        # Force garbage collection
+        gc.collect()
+        
+        response = send_file(
+            memory_zip,
+            mimetype='application/zip',
+            as_attachment=True,
+            download_name='processed_images.zip'
+        )
+        response.headers['X-Processing-Time'] = str(processing_time)
+        return response
+    
+    except Exception as e:
+        # Cleanup on error
+        if 'image_rdd' in locals():
+            image_rdd.unpersist()
+        
+        gc.collect()
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == '__main__':
     app.run(debug=True, port=8080)
